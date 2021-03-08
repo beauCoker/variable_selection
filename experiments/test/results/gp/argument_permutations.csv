@@ -1,0 +1,2 @@
+,--model,--dataset,--dim_in,--n_obs,--sig2,--opt_kernel_hyperparam,--dir_out
+0,GP,mixselect2,4,50,0.01,,../results/gp/0

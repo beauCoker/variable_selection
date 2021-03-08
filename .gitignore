@@ -1,0 +1,9 @@
+**/results
+**/__pycache__
+*.aux
+*.log
+*.out
+*.gz
+*.DS_Store
+*.bbl
+*.blg

@@ -1,0 +1,2 @@
+,--model,--dataset,--dim_in,--n_obs,--sig2,--n_burnin_hmc,--n_sample_hmc,--scale_global,--penalty_type,--n_rff,--dir_out
+0,RFFGRADPENHYPER,mixselect2,4,50,0.01,1000,1000,1,l2,500,../results/gradpenhyper_l2/0

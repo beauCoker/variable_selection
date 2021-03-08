@@ -1,0 +1,3 @@
+,--model,--dataset,--dim_in,--n_obs,--sig2,--n_burnin_hmc,--n_sample_hmc,--scale_global,--penalty_type,--n_rff,--lengthscale,--prior_w2_sig2,--dir_out
+0,RFFGRADPEN,mixselect2,4,50,0.01,1000,1000,1,l1,500,1,10.0,../results/gradpen_l1/0
+1,RFFGRADPEN,mixselect2,4,50,0.01,1000,1000,1,l1,500,5,10.0,../results/gradpen_l1/1
