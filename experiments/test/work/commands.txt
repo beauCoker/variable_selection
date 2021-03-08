@@ -1,0 +1,46 @@
+------------- Running python models -------------
+
+# GP
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/gp.txt \
+--dir_out ../results/gp
+
+# RFF
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/rff.txt \
+--dir_out ../results/rff
+
+# lasso
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/lasso.txt \
+--dir_out ../results/lasso
+
+# gradpen without inferring hyperparameters
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/gradpen_l1.txt \
+--dir_out ../results/gradpen_l1
+
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/gradpen_l2.txt \
+--dir_out ../results/gradpen_l2
+
+# gradpen with inferring hyperparameters
+
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/gradpenhyper_l1.txt \
+--dir_out ../results/gradpenhyper_l1
+
+python ../../../src/experimenter.py \
+--subproc ../../../src/var_importance/experiment.py \
+--args ../args/gradpenhyper_l2.txt \
+--dir_out ../results/gradpenhyper_l2
+
+
+# see all datasets
+python ../../../src/var_importance/data.py

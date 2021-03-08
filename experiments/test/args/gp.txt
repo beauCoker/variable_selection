@@ -1,0 +1,6 @@
+--model: GP
+--dataset: mixselect2
+--dim_in: 4
+--n_obs: 50
+--sig2: .01
+--opt_kernel_hyperparam:

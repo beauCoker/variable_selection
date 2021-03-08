@@ -1,0 +1,12 @@
+--model: RFFGRADPEN
+--dataset: mixselect2
+--dim_in: 4
+--n_obs: 50
+--sig2: .01
+--n_burnin_hmc: 1000
+--n_sample_hmc: 1000
+--scale_global: 1
+--penalty_type: l2
+--n_rff: 500
+--lengthscale: [1, 5]
+--prior_w2_sig2: 10.0
