@@ -60,6 +60,8 @@ def get_parser():
     parser.add_argument('--scale_global', type=float, default=1.0)
     parser.add_argument('--scale_groups', type=float, default=1.0)
     parser.add_argument('--penalty_type', type=str, default='l1', help='Choose "l1" for lasso or "l2" for ridge')
+    parser.add_argument('--infer_hyper', action='store_true')
+    parser.add_argument('--optimize_hyper', action='store_true')
 
     # GP options
     parser.add_argument('--opt_likelihood_variance', action='store_true')
@@ -119,6 +121,14 @@ def main(args=None):
         m = models.RffGradPenVarImportanceHyper(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
         samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc)
 
+    elif args.model=='RFFGRADPENHYPER_v2':
+        m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
+        samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_hyper=args.infer_hyper, optimize_hyper=args.optimize_hyper)
+
+        if args.optimize_hyper:
+            res['opt_lengthscale'] = m.model.lengthscale.numpy()
+            res['opt_prior_w2_sig2'] = m.model.prior_w2_sig2.numpy()
+
     elif args.model=='RFF':
         m = models.RffVarImportance(Z)
         m.train(data.x_train, data.y_train, args.sig2, rff_dim=n_rff, batch_size=args.batch_size, epochs=args.epochs)
@@ -144,17 +154,17 @@ def main(args=None):
     # --------- Analyze results -----------
 
     # variable importance
-    try:
-        psi_est_train = m.estimate_psi(data.x_train)
-        res['psi_mean_train'] = psi_est_train[0]
-        res['psi_var_train'] = psi_est_train[1]
+    #try:
+    psi_est_train = m.estimate_psi(data.x_train)
+    res['psi_mean_train'] = psi_est_train[0]
+    res['psi_var_train'] = psi_est_train[1]
 
-        if data.x_test is not None:
-            psi_est_test = m.estimate_psi(data.x_test)
-            res['psi_mean_test'] = psi_est_test[0]
-            res['psi_var_test'] = psi_est_test[1]
-    except:
-        print('Unable to compute variable importance')
+    if data.x_test is not None:
+        psi_est_test = m.estimate_psi(data.x_test)
+        res['psi_mean_test'] = psi_est_test[0]
+        res['psi_var_test'] = psi_est_test[1]
+    #except:
+    #    print('Unable to compute variable importance')
 
 
     # barplot of variable importance

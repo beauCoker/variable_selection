@@ -43,6 +43,7 @@ def hmc_tf(unnormalized_log_prob, init_values, num_results = int(10e3), num_burn
               num_burnin_steps=num_burnin_steps,
               current_state=init_values_tf,
               kernel=adaptive_hmc,
+              seed=1,
               trace_fn=lambda _, pkr: pkr.inner_results.is_accepted)
         
         # simple summary stats

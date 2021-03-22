@@ -603,16 +603,21 @@ class RffGradPenVarImportanceHyper(object):
         n_samp:  number of MC samples
         '''
 
-        X = torch.from_numpy(X)
         psi = np.zeros((self.samples[0].shape[0], X.shape[1]))
         n = X.shape[0]
+
+        w1 = self.model.w.unsqueeze(0).numpy()
+        b1 = self.model.b.reshape(1,-1).numpy()
+        X_w1 = X @ self.model.w.numpy().T
 
         for s in range(self.samples[0].shape[0]):
             w = self.samples[0][s,:] # output layer weights
             l = self.samples[1][s] # lengthscale
 
-            J = -sqrt(2/self.model.dim_hidden) * self.model.w.unsqueeze(0) / l * torch.sin(F.linear(X / l, self.model.w, self.model.b)).unsqueeze(-1) #analytical jacobian
-            J = J.numpy()
+            J = -sqrt(2/self.model.dim_hidden) * w1 / l * np.expand_dims(np.sin(X_w1 / l + b1), -1) #analytical jacobian
+            #J = -sqrt(2/self.model.dim_hidden) * self.model.w.unsqueeze(0) / l * tf.expand_dims(tf.math.sin(x_w_tf / l + tf.reshape(self.b_tf, (1,-1))), -1) # analytical jacobian
+            #J = J.numpy()
+
             Ax_d = [1/n*J[:,:,d].T@J[:,:,d] for d in range(self.model.dim_in)]
 
             for d in range(X.shape[1]):
@@ -627,6 +632,83 @@ class RffGradPenVarImportanceHyper(object):
         h = self.model.hidden_features(x, lengthscale = self.samples[1][i].item()).numpy()
         w2 = self.samples[0][i, :].reshape(-1,1)
         return (h@w2.reshape(-1,1)).reshape(-1)
+
+
+
+class RffGradPenVarImportanceHyper_v2(object):
+    def __init__(self, X, Y, dim_hidden=50, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1'):
+        super().__init__()
+
+        self.X = torch.from_numpy(X)
+        self.Y = torch.from_numpy(Y)
+        self.model = networks.sparse.RffGradPenHyper_v2(dim_in=X.shape[1], dim_hidden=dim_hidden, dim_out=Y.shape[1], prior_w2_sig2=prior_w2_sig2, noise_sig2=noise_sig2, scale_global=scale_global, groups=groups, scale_groups=scale_groups, lengthscale=lengthscale, penalty_type=penalty_type)
+
+    
+    def train_map(self):
+        '''
+        Train with HMC
+        '''
+        w2 = self.model.train_map(self.X, self.Y)
+        return w2
+
+
+    def train(self, num_results = int(10e3), num_burnin_steps = int(1e3), infer_hyper=False, optimize_hyper=False):
+        '''
+        Train with HMC
+        '''
+        self.samples, self.accept = self.model.train(self.X, self.Y, num_results = num_results, num_burnin_steps = num_burnin_steps, infer_hyper=infer_hyper, optimize_hyper=optimize_hyper)
+        
+        self.num_results = num_results
+        self.infer_hyper=infer_hyper
+        self.optimize_hyper=optimize_hyper
+        return self.samples, self.accept
+
+    def estimate_psi(self, X=None, n_samp=1000):
+        '''
+        Uses closed form
+
+        estimates mean and variance of variable importance psi
+        X:  inputs to evaluate gradient
+        n_samp:  number of MC samples
+        '''
+
+        # allocate space
+        psi = np.zeros((n_samp, X.shape[1]))
+        
+        # precompute
+        xw1 = self.model.compute_xw1(X)
+
+        if not self.infer_hyper:
+            Ax_d = self.model.grad_norm(x=None, xw1=xw1) # only need to compute once
+        
+        for i, s in enumerate(np.random.choice(self.num_results, size=min(n_samp, self.num_results), replace=False)):
+            if self.infer_hyper:
+                w2 = self.samples[0][s,:] # output layer weights
+                l = self.samples[1][s] # lengthscale
+                Ax_d = self.model.grad_norm(x=None, lengthscale=l, xw1=xw1) # recompute because depends on lengthscale
+            else:
+                w2 = self.samples[s,:]
+
+            for d in range(X.shape[1]):
+                psi[i,d] = w2.reshape(1,-1)@Ax_d[d]@w2.reshape(-1,1) 
+
+        return np.mean(psi,0), np.var(psi,0)
+
+    def sample_f_post(self, x):
+        s = np.random.choice(self.num_results) # should make sure same sample isn't selected more than once...
+        xw1 = self.model.compute_xw1(x) # is there a way to not keep rerunning this?
+
+        if self.infer_hyper:
+            w2 = self.samples[0][s,:] # output layer weights
+            l = self.samples[1][s] # lengthscale
+        else:
+            w2 = self.samples[s,:]
+            l = self.model.lengthscale
+
+        return self.model.forward(w2, xw1=xw1, lengthscale=l).numpy()
+
+
+
 
 
 

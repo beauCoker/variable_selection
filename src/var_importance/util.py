@@ -162,7 +162,7 @@ def plot_slice(f_sampler, x, y, quantile=.5, dim=0, n_samp=500, f_true=None, ax=
         ax.plot(x_plot, f_true(x_plot_all), color='orange', label='truth') # posterior mean
 
     # plot a few samples
-    n_samp_plot = max(3, n_samp)
+    n_samp_plot = min(10, n_samp)
     ax.plot(x_plot_all[:,dim].reshape(-1), f_samp_plot[:n_samp_plot,:].T, alpha=.1, color='blue')
 
 
