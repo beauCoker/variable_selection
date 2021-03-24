@@ -643,24 +643,15 @@ class RffGradPenVarImportanceHyper_v2(object):
         self.Y = torch.from_numpy(Y)
         self.model = networks.sparse.RffGradPenHyper_v2(dim_in=X.shape[1], dim_hidden=dim_hidden, dim_out=Y.shape[1], prior_w2_sig2=prior_w2_sig2, noise_sig2=noise_sig2, scale_global=scale_global, groups=groups, scale_groups=scale_groups, lengthscale=lengthscale, penalty_type=penalty_type)
 
-    
-    def train_map(self):
+
+    def train(self, num_results = int(10e3), num_burnin_steps = int(1e3), infer_hyper=False, w2_init=None):
         '''
         Train with HMC
         '''
-        w2 = self.model.train_map(self.X, self.Y)
-        return w2
-
-
-    def train(self, num_results = int(10e3), num_burnin_steps = int(1e3), infer_hyper=False, optimize_hyper=False):
-        '''
-        Train with HMC
-        '''
-        self.samples, self.accept = self.model.train(self.X, self.Y, num_results = num_results, num_burnin_steps = num_burnin_steps, infer_hyper=infer_hyper, optimize_hyper=optimize_hyper)
+        self.samples, self.accept = self.model.train(self.X, self.Y, num_results = num_results, num_burnin_steps = num_burnin_steps, infer_hyper=infer_hyper, w2_init=w2_init)
         
         self.num_results = num_results
         self.infer_hyper=infer_hyper
-        self.optimize_hyper=optimize_hyper
         return self.samples, self.accept
 
     def estimate_psi(self, X=None, n_samp=1000):

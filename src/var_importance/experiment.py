@@ -123,11 +123,21 @@ def main(args=None):
 
     elif args.model=='RFFGRADPENHYPER_v2':
         m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
-        samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_hyper=args.infer_hyper, optimize_hyper=args.optimize_hyper)
-
+        
         if args.optimize_hyper:
+            lr = args.lr / args.n_rff
+            w2_map, hyperparam_hist = m.model.train_map(data.x_train, data.y_train, n_epochs=args.epochs, learning_rate=lr, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=32)
             res['opt_lengthscale'] = m.model.lengthscale.numpy()
             res['opt_prior_w2_sig2'] = m.model.prior_w2_sig2.numpy()
+
+            # plot map estimate
+            f_map = lambda x: m.model.forward(w2=w2_map, x=x).numpy()
+            fig, ax = util.plot_slices(f_map, data.x_train, data.y_train, quantile=.5, n_samp=1, f_true=data.f, figsize=(4*args.dim_in,4))
+            fig.savefig(os.path.join(args.dir_out,'slices_map.png'))
+        else:
+            w2_map = None
+
+        samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_hyper=args.infer_hyper, w2_init=w2_map)
 
     elif args.model=='RFF':
         m = models.RffVarImportance(Z)
@@ -154,17 +164,17 @@ def main(args=None):
     # --------- Analyze results -----------
 
     # variable importance
-    #try:
-    psi_est_train = m.estimate_psi(data.x_train)
-    res['psi_mean_train'] = psi_est_train[0]
-    res['psi_var_train'] = psi_est_train[1]
+    try:
+        psi_est_train = m.estimate_psi(data.x_train)
+        res['psi_mean_train'] = psi_est_train[0]
+        res['psi_var_train'] = psi_est_train[1]
 
-    if data.x_test is not None:
-        psi_est_test = m.estimate_psi(data.x_test)
-        res['psi_mean_test'] = psi_est_test[0]
-        res['psi_var_test'] = psi_est_test[1]
-    #except:
-    #    print('Unable to compute variable importance')
+        if data.x_test is not None:
+            psi_est_test = m.estimate_psi(data.x_test)
+            res['psi_mean_test'] = psi_est_test[0]
+            res['psi_var_test'] = psi_est_test[1]
+    except:
+        print('Unable to compute variable importance')
 
 
     # barplot of variable importance
@@ -220,6 +230,17 @@ def main(args=None):
         print('Unable to plot posterior predictive')
 
 
+    # plot lengthscale and variance over optimization if available
+    if 'hyperparam_hist' in locals():
+        n_hyper = len(hyperparam_hist.keys())
+        if n_hyper > 0:
+            fig, ax = plt.subplots(1, n_hyper, figsize=(12,3))
+            for i, (key, val) in enumerate(hyperparam_hist.items()):
+                ax[i].plot(val, label=key)
+                ax[i].set_xlabel('epoch')
+                ax[i].legend()
+            fig.savefig(os.path.join(args.dir_out,'hyperparameter_opt.png'))
+            
     # RMSE
     try:
         # could clean up code
