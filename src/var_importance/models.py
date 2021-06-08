@@ -49,7 +49,8 @@ class GPyVarImportance(object):
         super().__init__()
 
         self.dim_in = X.shape[1]
-        self.kernel = GPy.kern.RBF(input_dim=self.dim_in, lengthscale=lengthscale, variance=variance)
+        #self.kernel = GPy.kern.RBF(input_dim=self.dim_in, lengthscale=lengthscale, variance=variance)
+        self.kernel = GPy.kern.RBF(input_dim=self.dim_in, lengthscale=lengthscale, variance=variance, ARD=True)
         self.model = GPy.models.GPRegression(X,Y,self.kernel)
         self.model.Gaussian_noise.variance = sig2
 
@@ -61,8 +62,10 @@ class GPyVarImportance(object):
 
         if not opt_kernel_hyperparam:
             self.model.kern.lengthscale.fix()
-            self.model.kern.variance.fix()
-        
+            self.model.kern.variance.fix() 
+
+        self.model.kern.variance.fix()   # MANUALLY ADDED
+
     def train(self):
         self.model.optimize_restarts(num_restarts = 1, verbose=False)
     
@@ -636,23 +639,33 @@ class RffGradPenVarImportanceHyper(object):
 
 
 class RffGradPenVarImportanceHyper_v2(object):
-    def __init__(self, X, Y, dim_hidden=50, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1'):
+    def __init__(self, X, Y, dim_hidden=50, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1', family='gaussian'):
         super().__init__()
 
         self.X = torch.from_numpy(X)
         self.Y = torch.from_numpy(Y)
-        self.model = networks.sparse.RffGradPenHyper_v2(dim_in=X.shape[1], dim_hidden=dim_hidden, dim_out=Y.shape[1], prior_w2_sig2=prior_w2_sig2, noise_sig2=noise_sig2, scale_global=scale_global, groups=groups, scale_groups=scale_groups, lengthscale=lengthscale, penalty_type=penalty_type)
+        self.model = networks.sparse.RffGradPenHyper_v2(dim_in=X.shape[1], dim_hidden=dim_hidden, dim_out=Y.shape[1], prior_w2_sig2=prior_w2_sig2, noise_sig2=noise_sig2, scale_global=scale_global, groups=groups, scale_groups=scale_groups, lengthscale=lengthscale, penalty_type=penalty_type, family=family)
 
 
-    def train(self, num_results = int(10e3), num_burnin_steps = int(1e3), infer_hyper=False, w2_init=None):
+    def train(self, num_results = int(10e3), num_burnin_steps = int(1e3), infer_lengthscale=False, infer_prior_w2_sig2=False, w2_init=None):
         '''
         Train with HMC
         '''
-        self.samples, self.accept = self.model.train(self.X, self.Y, num_results = num_results, num_burnin_steps = num_burnin_steps, infer_hyper=infer_hyper, w2_init=w2_init)
+        self.samples, self.accept = self.model.train(self.X, self.Y, num_results = num_results, num_burnin_steps = num_burnin_steps, infer_lengthscale=infer_lengthscale, infer_prior_w2_sig2=infer_prior_w2_sig2, w2_init=w2_init)
         
         self.num_results = num_results
-        self.infer_hyper=infer_hyper
+        self.infer_lengthscale=infer_lengthscale
+        self.infer_prior_w2_sig2=infer_prior_w2_sig2
         return self.samples, self.accept
+
+    def fit(self, num_results = int(10e3)):
+        mu, sig2 = self.model.fit(self.X, self.Y)
+
+        # hacks for now
+        self.num_results = num_results
+        self.infer_lengthscale=False
+        self.infer_prior_w2_sig2=False
+        self.samples = np.random.multivariate_normal(mu.numpy().reshape(-1), sig2.numpy(), num_results).astype(np.float32)
 
     def estimate_psi(self, X=None, n_samp=1000):
         '''
@@ -669,14 +682,18 @@ class RffGradPenVarImportanceHyper_v2(object):
         # precompute
         xw1 = self.model.compute_xw1(X)
 
-        if not self.infer_hyper:
+        if not self.infer_lengthscale:
             Ax_d = self.model.grad_norm(x=None, xw1=xw1) # only need to compute once
         
         for i, s in enumerate(np.random.choice(self.num_results, size=min(n_samp, self.num_results), replace=False)):
-            if self.infer_hyper:
+            if self.infer_lengthscale:
                 w2 = self.samples[0][s,:] # output layer weights
                 l = self.samples[1][s] # lengthscale
                 Ax_d = self.model.grad_norm(x=None, lengthscale=l, xw1=xw1) # recompute because depends on lengthscale
+
+            elif (not self.infer_lengthscale) and self.infer_prior_w2_sig2:
+                w2 = self.samples[0][s,:] # output layer weights
+
             else:
                 w2 = self.samples[s,:]
 
@@ -689,7 +706,7 @@ class RffGradPenVarImportanceHyper_v2(object):
         s = np.random.choice(self.num_results) # should make sure same sample isn't selected more than once...
         xw1 = self.model.compute_xw1(x) # is there a way to not keep rerunning this?
 
-        if self.infer_hyper:
+        if self.infer_lengthscale:
             w2 = self.samples[0][s,:] # output layer weights
             l = self.samples[1][s] # lengthscale
         else:

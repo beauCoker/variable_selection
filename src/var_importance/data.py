@@ -40,11 +40,13 @@ class Toy(Dataset):
                  x_test=None,
                  noise_sig2=1.0,
                  seed=0,
-                 standardize=True):
+                 standardize=True,
+                 family = 'gaussian'):
 
         self.f = lambda x: f(x).reshape(-1,1) # makes sure output is (n,1)
         self.noise_sig2 = noise_sig2
         self.dim_in = x_train.shape[1]
+        self.family = family
 
         # train
         self.x_train = x_train
@@ -73,6 +75,7 @@ class Toy(Dataset):
         if self.x_test is not None:
             self.f_test = self.f(self.x_test).reshape(-1,1)
 
+    '''
     def sample_y(self, seed=0):
         r_noise = np.random.RandomState(seed)
         
@@ -84,6 +87,32 @@ class Toy(Dataset):
         if self.x_test is not None:
             noise_test = r_noise.randn(self.n_test,1) * np.sqrt(self.noise_sig2)
             self.y_test = self.f_test + noise_test
+    '''
+
+    def sample_y(self, seed=0):
+        self.y_train = self.sample_y_(self.f_train, seed=seed)
+        if self.x_test is not None:
+            self.y_test = self.sample_y_(self.f_test, seed=seed+1)
+
+    def sample_y_(self, f, seed=0):
+        r = np.random.RandomState(seed)
+        size = (f.shape[0], 1)
+
+        if self.family == 'gaussian':
+            y = r.normal(loc=f, scale=np.sqrt(self.noise_sig2), size=size) # link: identity
+
+        elif self.family == 'poisson':
+            y = r.poisson(lam=np.exp(f), size=size) # link: log
+
+        elif self.family == 'binomial':
+            p = 1/(1+np.exp(-f))
+            temp = r.binomial(1, p, size=size)
+            y = r.binomial(1, p, size=size) # link: logit
+
+        else:
+            ValueError('family not recognized')
+
+        return y
 
     def evaluate_psi(self):
         grad_f = grad(self.f)
@@ -108,26 +137,27 @@ class Toy(Dataset):
             self.mu_x = np.mean(self.x_train, axis=0)
             self.sigma_x = np.std(self.x_train, axis=0)
 
-            #self.mu_f = np.mean(self.f_train, axis=0)
-            #self.sigma_f = np.std(self.f_train, axis=0)
-
-            self.mu_y = np.mean(self.y_train, axis=0)
-            self.sigma_y = np.std(self.y_train, axis=0)
-
             self.x_train = zscore(self.x_train, self.mu_x, self.sigma_x)
             if self.x_test is not None:
                 self.x_test = zscore(self.x_test, self.mu_x, self.sigma_x)
 
-            self.f_train = zscore(self.f_train, self.mu_y, self.sigma_y)
-            if self.f_test is not None:
-                self.f_test = zscore(self.f_test, self.mu_y, self.sigma_y)
+            if self.family == 'gaussian':
+                 #self.mu_f = np.mean(self.f_train, axis=0)
+                #self.sigma_f = np.std(self.f_train, axis=0)
 
-            self.y_train = zscore(self.y_train, self.mu_y, self.sigma_y)
-            if self.y_test is not None:
-                self.y_test = zscore(self.y_test, self.mu_y, self.sigma_y)
+                self.mu_y = np.mean(self.y_train, axis=0)
+                self.sigma_y = np.std(self.y_train, axis=0)
 
-            self.f_orig = self.f
-            self.f = lambda x: zscore(self.f_orig(un_zscore(x, self.mu_x, self.sigma_x)), self.mu_y, self.sigma_y)
+                self.f_train = zscore(self.f_train, self.mu_y, self.sigma_y)
+                if self.f_test is not None:
+                    self.f_test = zscore(self.f_test, self.mu_y, self.sigma_y)
+
+                self.y_train = zscore(self.y_train, self.mu_y, self.sigma_y)
+                if self.y_test is not None:
+                    self.y_test = zscore(self.y_test, self.mu_y, self.sigma_y)
+
+                self.f_orig = self.f
+                self.f = lambda x: zscore(self.f_orig(un_zscore(x, self.mu_x, self.sigma_x)), self.mu_y, self.sigma_y)
             self.standardized = True
 
     def unstandardize(self):
@@ -140,15 +170,17 @@ class Toy(Dataset):
             if self.x_test is not None:
                 self.x_test = un_zscore(self.x_test, self.mu_x, self.sigma_x)
 
-            self.f_train = un_zscore(self.f_train, self.mu_y, self.sigma_y)
-            if self.f_test is not None:
-                self.f_test = un_zscore(self.f_test, self.mu_y, self.sigma_y)
+            if self.family == 'gaussian':
+                self.f_train = un_zscore(self.f_train, self.mu_y, self.sigma_y)
+                if self.f_test is not None:
+                    self.f_test = un_zscore(self.f_test, self.mu_y, self.sigma_y)
 
-            self.y_train = un_zscore(self.y_train, self.mu_y, self.sigma_y)
-            if self.y_test is not None:
-                self.y_test = un_zscore(self.y_test, self.mu_y, self.sigma_y)
+                self.y_train = un_zscore(self.y_train, self.mu_y, self.sigma_y)
+                if self.y_test is not None:
+                    self.y_test = un_zscore(self.y_test, self.mu_y, self.sigma_y)
 
-            self.f = self.f_orig
+                self.f = self.f_orig
+
             self.standardized = False
 
 
@@ -186,7 +218,9 @@ def rff_toy(dim_in, noise_sig2, n_train, n_test=100, dim_hidden=50, seed_x=0, se
     # sample x
     r_x = np.random.RandomState(seed_x)
     x_train = r_x.randn(n_train, dim_in)
-    x_test = r_x.randn(n_test, dim_in)
+
+    r_x_test = np.random.RandomState(seed_x+1)
+    x_test = r_x_test.randn(n_test, dim_in)
 
     # ground truth function
     r_w = np.random.RandomState(seed_w)
@@ -220,6 +254,89 @@ def mixselect_toy(dim_in, noise_sig2, n_train, n_test=100, seed_x=0, seed_noise=
 
     return Toy(f, x_train, x_test, noise_sig2, seed_noise)
 
+def matlab_toy(dim_in, noise_sig2, n_train, n_test=100, seed_x=0, seed_noise=0, beta_scale=1.0):
+    '''
+    Based on Matlab example: https://www.mathworks.com/help/stats/lasso-regularization.html
+    '''
+
+    assert dim_in >= 2
+
+    r_x = np.random.RandomState(seed_x) 
+
+    x_train = np.zeros((n_train, dim_in))
+    for i in range(dim_in):
+        x_train[:,i] = r_x.exponential(1/(i+1), size=n_train)
+
+    x_test = np.zeros((n_test, dim_in))
+    for i in range(dim_in):
+        x_test[:,i] = r_x.exponential(1/(i+1), size=n_test)
+
+    beta = np.zeros(dim_in)
+    beta[0] = 2*beta_scale
+    beta[1] = -3*beta_scale
+
+    f = lambda x: x @ beta.reshape(-1,1)
+
+    return Toy(f, x_train, x_test, noise_sig2, seed_noise)
+
+
+def matlab2_toy(dim_in, noise_sig2, n_train, n_test=100, seed_x=0, seed_noise=0, beta_scale=1.0):
+    '''
+    Based on Matlab example: https://www.mathworks.com/help/stats/lasso-regularization.html
+    
+    Exactly as in documentation Except first two variables are nonzero. no standardization.
+    '''
+
+    assert dim_in >= 2
+    zscore = lambda x, mu, sigma: (x - mu.reshape(1,-1)) / sigma.reshape(1,-1)
+
+    r_x = np.random.RandomState(seed_x) 
+
+    x_train = np.zeros((n_train, dim_in))
+    for i in range(dim_in):
+        x_train[:,i] = r_x.exponential(i+1, size=n_train) # mean increases with input index
+    x_train[:4,:] = x_train[[1, 3, 0, 2], :] # 1-->0, 3-->1 (reorder so first two variables have nonzero importance)
+    x_train = zscore(x_train, np.mean(x_train, axis=0), np.std(x_train, axis=0))
+
+    x_test = np.zeros((n_test, dim_in))
+    for i in range(dim_in):
+        x_test[:,i] = r_x.exponential(i+1, size=n_test) # mean increases with input index
+    x_test[:4,:] = x_test[[1, 3, 0, 2], :] # 1-->0, 3-->1 (reorder so first two variables have nonzero importance)
+    x_test = zscore(x_test, np.mean(x_test, axis=0), np.std(x_test, axis=0))
+
+    beta = np.zeros(dim_in)
+    beta[0] = 2*beta_scale
+    beta[1] = -3*beta_scale
+
+    f = lambda x: x @ beta.reshape(-1,1)
+
+    return Toy(f, x_train, x_test, noise_sig2, seed_noise, standardize=False)
+
+def count_linear_toy(dim_in, n_train, n_test=100, seed_x=0, beta_scale=1.0):
+    r_x = np.random.RandomState(seed_x) 
+
+    x_train = r_x.uniform(0, 3, size=(n_train, dim_in))
+    x_test = r_x.uniform(0, 3, size=(n_test, dim_in))
+
+    #beta = np.random.choice(10, size=dim_in) * beta_scale
+    beta = np.array([1])
+    f = lambda x: x @ beta.reshape(-1,1)
+
+    return Toy(f, x_train, x_test, standardize=False, family='poisson')
+
+def binomial_linear_toy(dim_in, n_train, n_test=100, seed_x=0, beta_scale=1.0):
+    r_x = np.random.RandomState(seed_x) 
+
+    x_train = r_x.uniform(-8, 8, size=(n_train, dim_in))
+    x_test = r_x.uniform(-8, 8, size=(n_test, dim_in))
+
+    #beta = np.random.choice(10, size=dim_in) * beta_scale
+    beta = np.array([1])
+    f = lambda x: x @ beta.reshape(-1,1)
+
+    return Toy(f, x_train, x_test, standardize=False, family='binomial')
+
+
 def load_dataset(name, dim_in, noise_sig2, n_train, n_test=100, signal_scale=1.0, n_nonzero=1, subtract_covariates=False):
     '''
     inputs:
@@ -241,6 +358,18 @@ def load_dataset(name, dim_in, noise_sig2, n_train, n_test=100, signal_scale=1.0
 
     elif name == 'mixselect3':
         dataset = mixselect_toy(dim_in, noise_sig2, n_train, version=3)
+
+    elif name == 'matlab':
+        dataset = matlab_toy(dim_in, noise_sig2, n_train, beta_scale = signal_scale)
+
+    elif name == 'matlab2':
+        dataset = matlab2_toy(dim_in, noise_sig2, n_train, beta_scale = signal_scale)
+
+    elif name == 'count_linear':
+        dataset = count_linear_toy(dim_in, n_train, n_test=n_test, seed_x=0, beta_scale=signal_scale)
+
+    elif name == 'binomial_linear':
+        dataset = binomial_linear_toy(dim_in, n_train, n_test=n_test, seed_x=0, beta_scale=signal_scale)
 
     return dataset
     

@@ -14,6 +14,8 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+tf.keras.backend.set_floatx('float32')
+
 # local imports
 import bnn.layers.sparse as layers
 import bnn.inference
@@ -51,9 +53,11 @@ class BayesLinearLasso(nn.Module):
             resid = y_tf - x_tf@w
 
             # likelihood and L2 penalty
-            log_prob = -1/self.noise_sig2*tf.transpose(resid)@(resid) \
-                       - tf.transpose(w)@(1/self.prior_w2_sig2*tf.eye(self.dim_in, dtype=tf.float64))@w 
-            
+            log_prob = -1/(2*self.noise_sig2)*tf.transpose(resid)@(resid)
+                       
+            # L2 penalty?
+            #log_prob += - 1/(2*prior_w2_sig2)*tf.transpose(w2)@w2
+
             # Within group
             log_prob -= tf.math.reduce_sum(scale_global_tf*tf.math.abs(w)) # L1 penalty
             #log_prob -= tf.math.reduce_sum(scale_global_tf*w**2) # L2 penalty
@@ -391,7 +395,7 @@ class RffGradPenHyper_v2(object):
     -   lengthscale: Corresponds to lengthscale of RBF kernel. (scalar)
     -   penalty_type: select 'l1' for lasso penalty, 'l2' for ridge penalty (str)
     """
-    def __init__(self, dim_in, dim_hidden, dim_out, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1'):
+    def __init__(self, dim_in, dim_hidden, dim_out, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1', family='gaussian'):
         super(RffGradPenHyper_v2, self).__init__()
 
         ### architecture
@@ -405,18 +409,19 @@ class RffGradPenHyper_v2(object):
         self.scale_groups = scale_groups
         self.lengthscale = lengthscale
         self.penalty_type = penalty_type
+        self.family = family
 
         self.sample_features()
         self.act = lambda z: sqrt(2/self.dim_hidden)*tf.math.cos(z)
 
     def sample_features(self):
         # sample random weights for RFF features
-        self.w1 = tf.convert_to_tensor(np.random.normal(0,1,(self.dim_hidden, self.dim_in)))
-        self.b1 = tf.convert_to_tensor(np.random.uniform(0,2*pi,(self.dim_hidden,)))
+        self.w1 = tf.cast(tf.convert_to_tensor(np.random.normal(0,1,(self.dim_hidden, self.dim_in))), dtype=tf.float32)
+        self.b1 = tf.cast(tf.convert_to_tensor(np.random.uniform(0,2*pi,(self.dim_hidden,))), dtype=tf.float32)
 
     def compute_xw1(self, x):
         if not tf.is_tensor(x):
-            x = tf.convert_to_tensor(x, dtype=tf.float64)
+            x = tf.convert_to_tensor(x, dtype=tf.float32)
         return x @ tf.transpose(self.w1)
 
     def hidden_features(self, x=None, xw1=None, lengthscale=None):
@@ -449,14 +454,162 @@ class RffGradPenHyper_v2(object):
         Ax_d = [1/J.shape[0]*tf.transpose(J[:,:,d])@J[:,:,d] for d in range(self.dim_in)]
         return Ax_d
 
-    def make_unnormalized_log_prob(self, x, y, infer_hyper=False):
+    def log_marginal_likelihood(self, x, y):
+
+
+        ## GPy for comparison
+        import GPy
+        kernel = GPy.kern.RBF(input_dim=x.shape[1], lengthscale=self.lengthscale, variance=self.prior_w2_sig2)
+        K_gp = kernel.K(x,x) # (n, n)
+
+        gp = GPy.models.GPRegression(x,y,kernel)
+        gp.Gaussian_noise.variance = self.noise_sig2
+
+        log_prob_gp = gp.log_likelihood()
+
+
+        ## regular log marginal likelihood
+        n = x.shape[0]
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+
+        h = self.hidden_features(x)
+        K = h @ tf.transpose(h) * self.prior_w2_sig2
+
+        A = K + self.noise_sig2*tf.eye(n)
+
+        log_prob = -0.5*n*np.log(2*np.pi) - 0.5*tf.linalg.logdet(A) - 0.5*tf.transpose(y) @ tf.linalg.inv(A) @ y
+
+
+        ## faster way
+        m = int(self.dim_hidden / 2)
+        phi = h * np.sqrt(self.dim_hidden/2)
+
+
+        A = tf.transpose(phi)@phi + m*self.noise_sig2/self.prior_w2_sig2*tf.eye(2*m)
+
+        R = tf.linalg.cholesky(A)
+        alpha1 = tf.linalg.solve(R, tf.transpose(phi)@y)
+
+        log_prob2 = -1/(2*self.noise_sig2)*(tf.norm(y)**2 - tf.norm(alpha1)**2) - 0.5*tf.reduce_sum(tf.math.log(tf.linalg.diag_part(R)**2)) + m*np.log(m*self.noise_sig2/self.prior_w2_sig2) - n/2*np.log(2*np.pi*self.noise_sig2)
+
+        breakpoint()
+
+    def make_log_marginal_likelihood(self, x, y):
+
+        xw1 = self.compute_xw1(x)
+
+        @tf.function
+        def unnormalized_log_prob(lengthscale, xw1=xw1):
+
+            n = x.shape[0]
+            h = self.hidden_features(x=None, xw1=xw1, lengthscale=lengthscale)
+            m = int(self.dim_hidden / 2)
+            phi = h * np.sqrt(self.dim_hidden/2)
+            A = tf.transpose(phi)@phi + m*self.noise_sig2/self.prior_w2_sig2*tf.eye(2*m)
+            R = tf.linalg.cholesky(A)
+            alpha1 = tf.linalg.solve(R, tf.transpose(phi)@y)
+            log_prob = -1/(2*self.noise_sig2)*(tf.norm(y)**2 - tf.norm(alpha1)**2) - 0.5*tf.reduce_sum(tf.math.log(tf.linalg.diag_part(R)**2)) + m*tf.math.log(m*self.noise_sig2/self.prior_w2_sig2) - n/2*np.log(2*np.pi*self.noise_sig2)
+
+            return log_prob
+
+        return unnormalized_log_prob
+        
+
+
+
+    def train_log_marginal_likelihood(self, x, y, n_epochs, learning_rate=0.001, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=None):
+        
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+
+        hyperparam_hist = {}
+        
+
+        lengthscale_map = tfp.math.softplus_inverse(tf.constant(self.lengthscale, dtype=tf.float32)) # note: _map is untransformed by softplus
+        
+        lengthscale_map = tf.Variable(lengthscale_map, dtype=np.float32)
+        hyperparam_hist['lengthscale'] = [tf.math.softplus(lengthscale_map).numpy()]
+        print('lengthscale init: ', hyperparam_hist['lengthscale'][0])
+
+        #prior_w2_sig2_map = tfp.math.softplus_inverse(tf.constant(self.prior_w2_sig2, dtype=tf.float32)) # note: _map is untransformed by softplus
+        #prior_w2_sig2_map = tf.Variable(prior_w2_sig2_map, dtype=np.float32)
+        #hyperparam_hist['prior_w2_sig2'] = [tf.math.softplus(prior_w2_sig2_map).numpy()]
+        #print('prior_w2_sig2 init: ', hyperparam_hist['prior_w2_sig2'][0])
+
+        opt = tf.keras.optimizers.SGD(learning_rate=learning_rate, clipvalue=clipvalue)
+
+        train_dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        if batch_size is None:
+            batch_size = x.shape[0]# full batch
+        train_dataset = train_dataset.batch(batch_size)
+
+        n_no_improvement = 0 # for early stopping
+
+        neg_log_marginal_likelihoods = [] # one for each batch
+        for xbatch, ybatch in train_dataset:
+            log_marginal_likelihood_ = self.make_log_marginal_likelihood(xbatch, ybatch)
+
+            log_marginal_likelihood = lambda lengthscale: log_marginal_likelihood_(tf.math.softplus(lengthscale)) # use softpluses
+            var_list = [lengthscale_map]
+
+            neg_log_marginal_likelihoods.append(lambda: -log_marginal_likelihood(*var_list)) # evaluate on Variables
+
+        for epoch in range(n_epochs):
+            for neg_log_marginal_likelihood in neg_log_marginal_likelihoods:
+
+                opt.minimize(neg_log_marginal_likelihood, var_list=var_list)
+
+                ### if you want to processes the gradients
+                #with tf.GradientTape() as tape:
+                #    loss = neg_log_marginal_likelihood()
+                #grads = tape.gradient(loss, var_list)
+                #grads = [tf.clip_by_norm(g, 500.) for g in grads]
+                #opt.apply_gradients(zip(grads, var_list))
+                #print(tf.math.softplus(lengthscale_map))
+                
+                ###
+
+            hyperparam_hist['lengthscale'].append(tf.math.softplus(lengthscale_map).numpy().item())
+            #hyperparam_hist['prior_w2_sig2'].append(tf.math.softplus(prior_w2_sig2_map).numpy().item())
+
+            if early_stopping:
+                if np.all([np.abs(val[-1] - val[-2]) < tol for val in hyperparam_hist.values()]):
+                    n_no_improvement += 1
+                else:
+                    n_no_improvement = 0
+                if n_no_improvement==patience:
+                    break
+
+        # unpack
+        self.lengthscale = tf.convert_to_tensor(tf.math.softplus(lengthscale_map)).numpy().item()
+        #self.prior_w2_sig2 = tf.convert_to_tensor(tf.math.softplus(prior_w2_sig2_map)).numpy().item()
+
+        print('lengthscale final: ', self.lengthscale)
+        #print('prior_w2_sig2 final: ', self.prior_w2_sig2)
+        
+        return hyperparam_hist
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def make_unnormalized_log_prob(self, x, y, infer_lengthscale=False):
 
         # for lengthscale prior and prior_w2_sig2 hyperprior (should move this to init...)
-        lengthscale_alpha = tf.convert_to_tensor(1.0, dtype=tf.float64)
-        lengthscale_beta = tf.convert_to_tensor(1.0, dtype=tf.float64)
+        lengthscale_alpha = tf.convert_to_tensor(1.0, dtype=tf.float32)
+        lengthscale_beta = tf.convert_to_tensor(1.0, dtype=tf.float32)
 
-        prior_w2_sig2_alpha = tf.convert_to_tensor(1.0, dtype=tf.float64)
-        prior_w2_sig2_beta = tf.convert_to_tensor(1.0, dtype=tf.float64)
+        prior_w2_sig2_alpha = tf.convert_to_tensor(1.0, dtype=tf.float32)
+        prior_w2_sig2_beta = tf.convert_to_tensor(1.0, dtype=tf.float32)
 
         def log_prob_invgamma(x, alpha, beta):
             unnormalized_prob = -(1. + alpha) * tf.math.log(x) - beta / x
@@ -468,8 +621,8 @@ class RffGradPenHyper_v2(object):
         h = self.hidden_features(x=None, xw1=xw1, lengthscale=self.lengthscale)
         Ax_d = self.grad_norm(x=None, xw1=xw1, lengthscale=self.lengthscale)
 
-        #@tf.function
-        def unnormalized_log_prob(w2, lengthscale=None, prior_w2_sig2=None, infer_hyper=infer_hyper, xw1=xw1, h=h, Ax_d=Ax_d):
+        @tf.function
+        def unnormalized_log_prob(w2, lengthscale, prior_w2_sig2, infer_lengthscale=infer_lengthscale, xw1=xw1, h=h, Ax_d=Ax_d, family=self.family):
             '''
             w2: output layer weights
             lengthscale: lengthscale
@@ -478,29 +631,31 @@ class RffGradPenHyper_v2(object):
             lengthscale and prior_w2_sig2 are only used if infer_hyper is True
             '''
 
-            if infer_hyper:
+            if infer_lengthscale:
                 # recompute hidden features and gradient penalty (because they depend on lengthscale)
                 h = self.hidden_features(x=None, xw1=xw1, lengthscale=lengthscale)
                 Ax_d = self.grad_norm(x=None, xw1=xw1, lengthscale=lengthscale)
-            else:
-                # otherwise use
-                lengthscale = tf.constant(self.lengthscale, dtype=tf.float64)
-                prior_w2_sig2 = tf.constant(self.prior_w2_sig2, dtype=tf.float64)
 
-            resid = y - self.forward(w2, h=h)
+            f_pred = self.forward(w2, h=h)
+            resid = y - f_pred
 
             # likelihood
-            log_prob = -1/(2*self.noise_sig2)*tf.transpose(resid)@(resid)
+            if family == 'gaussian':
+                log_prob = -1/(2*self.noise_sig2)*tf.transpose(resid)@(resid)
+            elif family == 'poisson':
+                log_prob = tf.reduce_sum(y * f_pred - tf.math.exp(f_pred))
+            elif family == 'binomial':
+                #p_pred = tf.math.sigmoid(f_pred)
+                #log_prob = tf.reduce_sum(y*tf.math.log(p_pred) + (1-y)*tf.math.log(p_pred))
+                log_prob = tf.reduce_sum(y*f_pred - tf.math.log(1+tf.math.exp(f_pred)))
 
             # L2 penalty
             log_prob += - 1/(2*prior_w2_sig2)*tf.transpose(w2)@w2
             
             # prior_w2_sig2 hyperprior
-            #print('prior_w2_sig2: ', prior_w2_sig2)
             log_prob += log_prob_invgamma(prior_w2_sig2, prior_w2_sig2_alpha, prior_w2_sig2_beta) 
 
             # lengthscale prior
-            #print('lengthscale: ', lengthscale)
             log_prob += log_prob_invgamma(lengthscale**2, lengthscale_alpha, lengthscale_beta) 
             
             # Within group gradient penalty
@@ -529,44 +684,77 @@ class RffGradPenHyper_v2(object):
 
 
 
-    def train_map(self, x, y, n_epochs, learning_rate=0.001, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=None):
-        x = tf.convert_to_tensor(x)
-        y = tf.convert_to_tensor(y)
+    def train_map(self, x, y, n_epochs, learning_rate=0.001, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=None, infer_lengthscale=True, infer_prior_w2_sig2=True):
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+
+        hyperparam_hist = {}
         
         # starting values
-        w2_map = tf.Variable(np.random.randn(self.dim_hidden,1)/self.dim_hidden, dtype=np.float64)
-        lengthscale_map = tf.Variable(self.lengthscale, dtype=np.float64)
-        prior_w2_sig2_map = tf.Variable(self.prior_w2_sig2, dtype=np.float64)
-        
-        print('lengthscale init: ', lengthscale_map.numpy())
-        print('prior_w2_sig2 init: ', prior_w2_sig2_map.numpy())
+        w2_map = tf.Variable(np.random.randn(self.dim_hidden,1)/self.dim_hidden, dtype=np.float32)
+
+
+        lengthscale_map = tfp.math.softplus_inverse(tf.constant(self.lengthscale, dtype=tf.float32)) # note: _map is untransformed by softplus
+        if infer_lengthscale:
+            lengthscale_map = tf.Variable(lengthscale_map, dtype=np.float32)
+            hyperparam_hist['lengthscale'] = [tf.math.softplus(lengthscale_map).numpy()]
+            print('lengthscale init: ', hyperparam_hist['lengthscale'][0])
+
+        prior_w2_sig2_map = tfp.math.softplus_inverse(tf.constant(self.prior_w2_sig2, dtype=tf.float32)) # note: _map is untransformed by softplus
+        if infer_prior_w2_sig2:
+            prior_w2_sig2_map = tf.Variable(prior_w2_sig2_map, dtype=np.float32)
+            hyperparam_hist['prior_w2_sig2'] = [tf.math.softplus(prior_w2_sig2_map).numpy()]
+            print('lengthscale init: ', hyperparam_hist['prior_w2_sig2'][0])
 
         opt = tf.keras.optimizers.SGD(learning_rate=learning_rate, clipvalue=clipvalue)
-
-        hyperparam_hist = {
-            'lengthscale': [lengthscale_map.numpy()],
-            'prior_w2_sig2': [prior_w2_sig2_map.numpy()]
-        }
-
-        n_no_improvement = 0 # for early stopping
 
         train_dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if batch_size is None:
             batch_size = x.shape[0]# full batch
         train_dataset = train_dataset.batch(batch_size)
 
+        n_no_improvement = 0 # for early stopping
+
         unnormalized_neg_log_probs = [] # one for each batch
         for xbatch, ybatch in train_dataset:
-            unnormalized_log_prob, _ = self.make_unnormalized_log_prob(xbatch, ybatch, infer_hyper=True)
-            unnormalized_log_prob_ = lambda w2, lengthscale, prior_w2_sig2: unnormalized_log_prob(w2, tf.math.softplus(lengthscale), tf.math.softplus(prior_w2_sig2)) # use softpluses
-            unnormalized_neg_log_probs.append(lambda: -unnormalized_log_prob_(w2_map, lengthscale_map, prior_w2_sig2_map)) # evaluate on Variables
+            unnormalized_log_prob_, _ = self.make_unnormalized_log_prob(xbatch, ybatch, infer_lengthscale=infer_lengthscale)
+
+            if infer_lengthscale and infer_prior_w2_sig2:
+                unnormalized_log_prob = lambda w2, lengthscale, prior_w2_sig2: unnormalized_log_prob_(w2, tf.math.softplus(lengthscale), tf.math.softplus(prior_w2_sig2)) # use softpluses
+                var_list = [w2_map, lengthscale_map, prior_w2_sig2_map]
+
+            elif infer_lengthscale and (not infer_prior_w2_sig2):
+                unnormalized_log_prob = lambda w2, lengthscale: unnormalized_log_prob_(w2, tf.math.softplus(lengthscale), tf.math.softplus(prior_w2_sig2_map)) # use softpluses
+                var_list = [w2_map, lengthscale_map]
+
+            elif (not infer_lengthscale) and infer_prior_w2_sig2:
+                unnormalized_log_prob = lambda w2, prior_w2_sig2: unnormalized_log_prob_(w2, tf.math.softplus(lengthscale_map), tf.math.softplus(prior_w2_sig2)) # use softpluses
+                var_list = [w2_map, prior_w2_sig2_map]
+
+            else:
+                unnormalized_log_prob = lambda w2: unnormalized_log_prob_(w2, tf.math.softplus(lengthscale_map), tf.math.softplus(prior_w2_sig2_map)) # use softpluses
+                var_list = [w2_map]
+
+            unnormalized_neg_log_probs.append(lambda: -unnormalized_log_prob(*var_list)) # evaluate on Variables
 
         for epoch in range(n_epochs):
             for unnormalized_neg_log_prob in unnormalized_neg_log_probs:
-                opt.minimize(unnormalized_neg_log_prob, var_list=[w2_map, lengthscale_map, prior_w2_sig2_map])
+                #opt.minimize(unnormalized_neg_log_prob, var_list=var_list)
 
-            hyperparam_hist['lengthscale'].append(tf.math.softplus(lengthscale_map).numpy().item())
-            hyperparam_hist['prior_w2_sig2'].append(tf.math.softplus(prior_w2_sig2_map).numpy().item())
+                ### if you want to processes the gradients
+                with tf.GradientTape() as tape:
+                    loss = unnormalized_neg_log_prob()
+                grads = tape.gradient(loss, var_list)
+                grads = [tf.clip_by_norm(g, 500.) for g in grads]
+                opt.apply_gradients(zip(grads, var_list))
+                print(tf.math.softplus(lengthscale_map))
+                ###
+
+            if infer_lengthscale:
+                hyperparam_hist['lengthscale'].append(tf.math.softplus(lengthscale_map).numpy().item())
+
+            if infer_prior_w2_sig2:
+                hyperparam_hist['prior_w2_sig2'].append(tf.math.softplus(prior_w2_sig2_map).numpy().item())
 
             if early_stopping:
                 if np.all([np.abs(val[-1] - val[-2]) < tol for val in hyperparam_hist.values()]):
@@ -578,34 +766,51 @@ class RffGradPenHyper_v2(object):
 
         # unpack
         w2 = tf.convert_to_tensor(w2_map)
-        self.lengthscale = tf.convert_to_tensor(tf.math.softplus(lengthscale_map))
-        self.prior_w2_sig2 = tf.convert_to_tensor(tf.math.softplus(prior_w2_sig2_map))
+        if infer_lengthscale:
+            self.lengthscale = tf.convert_to_tensor(tf.math.softplus(lengthscale_map)).numpy().item()
 
+        if infer_prior_w2_sig2:
+            self.prior_w2_sig2 = tf.convert_to_tensor(tf.math.softplus(prior_w2_sig2_map)).numpy().item()
 
-        print('lengthscale final: ', self.lengthscale.numpy())
-        print('prior_w2_sig2 final: ', self.prior_w2_sig2.numpy())
+        print('lengthscale final: ', self.lengthscale)
+        print('prior_w2_sig2 final: ', self.prior_w2_sig2)
         
         return w2, hyperparam_hist
 
 
-    def train(self, x, y, num_results = int(10e3), num_burnin_steps = int(1e3), infer_hyper=False, w2_init=None):
+    def train(self, x, y, num_results = int(10e3), num_burnin_steps = int(1e3), infer_lengthscale=False, infer_prior_w2_sig2=False, w2_init=None):
         '''
         '''
-        x = tf.convert_to_tensor(x)
-        y = tf.convert_to_tensor(y)
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
 
         # initialize w2 randomly or to MAP
         if w2_init is None:
-            w2_init = tf.convert_to_tensor(np.random.randn(self.dim_hidden,1)/self.dim_hidden)
+            w2_init = tf.cast(tf.convert_to_tensor(np.random.randn(self.dim_hidden,1)/self.dim_hidden), tf.float32)
 
         # set up objective and initialization depending if variational parameters inferred
-        unnormalized_log_prob_, _ = self.make_unnormalized_log_prob(x, y, infer_hyper=infer_hyper)
-        if infer_hyper:
-            init_values = [w2_init, tf.constant(self.lengthscale, dtype=tf.float64), tf.constant(self.prior_w2_sig2, dtype=tf.float64)]
-            unnormalized_log_prob = unnormalized_log_prob_
+        unnormalized_log_prob_, _ = self.make_unnormalized_log_prob(x, y, infer_lengthscale=infer_lengthscale)
+
+        if infer_lengthscale and infer_prior_w2_sig2:
+            unnormalized_log_prob = lambda w2, lengthscale, prior_w2_sig2: unnormalized_log_prob_(w2, lengthscale, prior_w2_sig2) 
+            init_values = [w2_init, tf.constant(self.lengthscale, dtype=tf.float32), tf.constant(self.prior_w2_sig2, dtype=tf.float32)]
+
+        elif infer_lengthscale and (not infer_prior_w2_sig2):
+            unnormalized_log_prob = lambda w2, lengthscale: unnormalized_log_prob_(w2, lengthscale, self.prior_w2_sig2)
+            init_values = [w2_init, tf.constant(self.lengthscale, dtype=tf.float32)]
+
+        elif (not infer_lengthscale) and infer_prior_w2_sig2:
+            unnormalized_log_prob = lambda w2, prior_w2_sig2: unnormalized_log_prob_(w2, self.lengthscale, prior_w2_sig2)
+            init_values = [w2_init, tf.constant(self.prior_w2_sig2, dtype=tf.float32)]
+
         else:
-            init_values = w2_init
             unnormalized_log_prob = lambda w2: unnormalized_log_prob_(w2, self.lengthscale, self.prior_w2_sig2)
+            init_values = w2_init
+
+        ###
+        #breakpoint()
+        #unnormalized_log_prob(w2_init)
+        ###
 
         samples, accept = bnn.inference.mcmc.hmc_tf(unnormalized_log_prob, 
             init_values, 
@@ -615,6 +820,28 @@ class RffGradPenHyper_v2(object):
             step_size=1.)
 
         return samples, accept
+
+
+    def fit(self, x, y):
+        '''
+        Computes conjugate posterior
+        '''
+        assert self.penalty_type == 'l2'
+        #assert np.all([s==self.scale_global[0] for s in self.scale_global]) # only works if all scales are the same (easy to adapt if not though)
+        
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+
+        h = self.hidden_features(x, lengthscale=self.lengthscale)
+        Ax_d = self.grad_norm(x, lengthscale=self.lengthscale)
+        Ax_d = [s*A for s,A in zip(self.scale_global, Ax_d)] # multiply by scale
+        Ax = tf.reduce_sum(tf.stack(Ax_d),0) # sum over input dimension
+
+        prior_sig2inv_mat = 1/self.prior_w2_sig2*tf.eye(self.dim_hidden) + Ax # prior includes gradient penalty
+        sig2 = tf.linalg.inv(prior_sig2inv_mat + tf.transpose(h)@(h)/self.noise_sig2) # Should replace with cholesky
+        mu = sig2 @ tf.transpose(h)@y/self.noise_sig2
+
+        return mu, sig2
 
         
 class RffHs(nn.Module):

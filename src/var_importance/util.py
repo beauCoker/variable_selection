@@ -5,7 +5,7 @@ import sys
 # package imports
 import numpy as np
 import pandas as pd
-from scipy.stats import multivariate_normal
+from scipy.stats import multivariate_normal, norm
 import matplotlib.pyplot as plt
 import GPy
 import seaborn as sns
@@ -29,6 +29,10 @@ def mpiw(f_pred_lb, f_pred_ub):
 
 def test_log_likelihood(mean, cov, test_y):
     return multivariate_normal.logpdf(test_y.reshape(-1), mean.reshape(-1), cov)
+
+def test_log_likelihood_indep(mean, std, test_y):
+    return np.sum(norm.logpdf(test_y.reshape(-1), mean.reshape(-1), std.reshape(-1)))
+
 
 
 ## --------------- RFF --------------- 
@@ -164,6 +168,22 @@ def plot_slice(f_sampler, x, y, quantile=.5, dim=0, n_samp=500, f_true=None, ax=
     # plot a few samples
     n_samp_plot = min(10, n_samp)
     ax.plot(x_plot_all[:,dim].reshape(-1), f_samp_plot[:n_samp_plot,:].T, alpha=.1, color='blue')
+
+    '''
+    ### TEMP
+    breakpoint()
+    out = {
+    'dim': dim,
+    'x': x,
+    'y': y,
+    'x_plot': x_plot,
+    'f_true': f_true(x_plot_all),
+    'f_samp_mean': np.mean(f_samp_plot, 0),
+    'f_samp_std': np.std(f_samp_plot, 0)
+    }
+    np.save('slice_dim=%d.npy' % dim, out)
+    ### 
+    '''
 
 
 def plot_slices(f_sampler, x, y, quantile=.5, n_samp=500, f_true=None, figsize=(4,4)):  

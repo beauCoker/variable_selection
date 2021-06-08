@@ -31,6 +31,7 @@ def get_parser():
     parser.add_argument('--subtract_covariates', action='store_true', help='use Y - beta*X as outcome')
     parser.add_argument('--beta_scale', type=float, default=1.0)
     parser.add_argument('--n_nonzero', type=int, default=1)
+    parser.add_argument('--n_zero', type=int, default=None, help='alternative to using dim_in. by default not used')
     
     # general model argument 
     parser.add_argument('--model', type=str, default='GP', help='select e.g. "GP" or "RFF"')
@@ -42,9 +43,11 @@ def get_parser():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--family', type=str, default='gaussian')
 
     # general RFF options
     parser.add_argument('--n_rff', type=int, default=None, help='set to sqrt(n)log(n) if set to None')
+    parser.add_argument('--n_rff_multiple', type=float, default=None, help='if not None, overrides n_rff to a multiple of n_obs')
 
     # RffVarSelect options
     parser.add_argument('--layer_in_name', type=str, default='RffVarSelectLogitNormalLayer')
@@ -81,6 +84,9 @@ def main(args=None):
     with open(os.path.join(args.dir_out, 'program_info.txt'), 'w') as f:
         f.write('Call:\n%s\n\n' % ' '.join(sys.argv[:]))
 
+    ## inverse link for glm
+    inverse_link = {'gaussian': lambda z: z, 'poisson': lambda z: np.exp(z), 'binomial': lambda z: 1/(1+np.exp(-z))}
+
     ## allocate space for results
     res = {}
 
@@ -90,8 +96,17 @@ def main(args=None):
     else:
         n_rff = args.n_rff
 
+    if args.n_rff_multiple is not None:
+        n_rff = int(args.n_rff_multiple * args.n_obs)
+
+    if args.n_zero is not None:
+        dim_in = args.n_nonzero + args.n_zero
+    else:
+        dim_in = args.dim_in
+
+
     # --------- Load data -----------
-    data = load_dataset(args.dataset, dim_in=args.dim_in, noise_sig2=args.sig2, n_train=args.n_obs, signal_scale=args.beta_scale, n_nonzero=args.n_nonzero, subtract_covariates=args.subtract_covariates)
+    data = load_dataset(args.dataset, dim_in=dim_in, noise_sig2=args.sig2, n_train=args.n_obs, signal_scale=args.beta_scale, n_nonzero=args.n_nonzero, subtract_covariates=args.subtract_covariates)
 
     res['psi_train_true'] = data.psi_train
     res['psi_test_true'] = data.psi_test
@@ -99,45 +114,63 @@ def main(args=None):
     # --------- Train model -----------
     start_time = time.time()
     if args.model=='GP':
+        #kernel_lengthscale = args.kernel_lengthscale
+        kernel_lengthscale = [args.kernel_lengthscale]*args.n_nonzero + [1e6]*(dim_in-args.n_nonzero)
+
         m = models.GPyVarImportance(data.x_train, data.y_train, sig2=args.sig2, \
             opt_kernel_hyperparam=args.opt_kernel_hyperparam, \
             opt_sig2=args.opt_likelihood_variance,\
-            lengthscale=args.kernel_lengthscale, variance=args.kernel_variance)
+            lengthscale=kernel_lengthscale, variance=args.kernel_variance)
 
         m.train()
-        res['kernel_lengthscale'] = m.model.kern.lengthscale.item()
+        try:
+            res['kernel_lengthscale'] = m.model.kern.lengthscale.item()
+        except:
+            pass
         res['kernel_variance'] = m.model.kern.variance.item()
         print(m.model) 
 
     elif args.model=='BAYESLINEARLASSO':
-        m = models.BayesLinearLassoVarImportance(data.x_train, data.y_train, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in)          
+        m = models.BayesLinearLassoVarImportance(data.x_train, data.y_train, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*dim_in)          
         samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc)
 
     elif args.model=='RFFGRADPEN':
-        m = models.RffGradPenVarImportance(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
+        m = models.RffGradPenVarImportance(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
         samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc)
 
     elif args.model=='RFFGRADPENHYPER':
-        m = models.RffGradPenVarImportanceHyper(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
+        m = models.RffGradPenVarImportanceHyper(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
         samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc)
 
     elif args.model=='RFFGRADPENHYPER_v2':
-        m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*args.dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type)                        
-        
+        #m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*dim_in, lengthscale=args.lengthscale, penalty_type=args.penalty_type, family=args.family)                        
+        #m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[0, args.scale_global], lengthscale=args.lengthscale, penalty_type=args.penalty_type, family=args.family) # TEMP         
+        #m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[0, 0] + [args.scale_global]*3, lengthscale=args.lengthscale, penalty_type=args.penalty_type, family=args.family) # TEMP
+        m = models.RffGradPenVarImportanceHyper_v2(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[0]*args.n_nonzero + [args.scale_global]*(dim_in-args.n_nonzero), lengthscale=args.lengthscale, penalty_type=args.penalty_type, family=args.family) # TEMP. penalyze only zero variables.
+
         if args.optimize_hyper:
-            lr = args.lr / args.n_rff
-            w2_map, hyperparam_hist = m.model.train_map(data.x_train, data.y_train, n_epochs=args.epochs, learning_rate=lr, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=32)
-            res['opt_lengthscale'] = m.model.lengthscale.numpy()
-            res['opt_prior_w2_sig2'] = m.model.prior_w2_sig2.numpy()
+            #lr = args.lr / args.n_rff
+            lr = args.lr
+            #w2_map, hyperparam_hist = m.model.train_map(data.x_train, data.y_train, n_epochs=args.epochs, learning_rate=lr, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=32, infer_lengthscale=True, infer_prior_w2_sig2=False)
+            
+            ## using log marginal likelihood
+            hyperparam_hist = m.model.train_log_marginal_likelihood(data.x_train, data.y_train, n_epochs=args.epochs, learning_rate=lr, early_stopping=False, tol=1e-4, patience=3, clipvalue=100, batch_size=32)
+            w2_map = None
+            ##
+
+            res['opt_lengthscale'] = m.model.lengthscale
+            res['opt_prior_w2_sig2'] = m.model.prior_w2_sig2
 
             # plot map estimate
-            f_map = lambda x: m.model.forward(w2=w2_map, x=x).numpy()
-            fig, ax = util.plot_slices(f_map, data.x_train, data.y_train, quantile=.5, n_samp=1, f_true=data.f, figsize=(4*args.dim_in,4))
-            fig.savefig(os.path.join(args.dir_out,'slices_map.png'))
+            if w2_map is not None:
+                f_map = lambda x: m.model.forward(w2=w2_map, x=x).numpy()
+                fig, ax = util.plot_slices(f_map, data.x_train, data.y_train, quantile=.5, n_samp=1, f_true=data.f, figsize=(4*dim_in,4))
+                fig.savefig(os.path.join(args.dir_out,'slices_map.png'))
         else:
             w2_map = None
 
-        samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_hyper=args.infer_hyper, w2_init=w2_map)
+        #samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_lengthscale=args.infer_hyper, infer_prior_w2_sig2=False, w2_init=w2_map) # OPTIONS HARDCODED
+        m.fit(num_results = args.n_sample_hmc) # closed form
 
     elif args.model=='RFF':
         m = models.RffVarImportance(Z)
@@ -180,7 +213,7 @@ def main(args=None):
     # barplot of variable importance
     try:
         df = pd.DataFrame({
-            'variable': np.arange(args.dim_in),
+            'variable': np.arange(dim_in),
             'estimated': psi_est_train[0],
         })
         if data.psi_train is not None:
@@ -194,7 +227,7 @@ def main(args=None):
 
         if data.x_test is not None:
             df = pd.DataFrame({
-            'variable': np.arange(args.dim_in),
+            'variable': np.arange(dim_in),
             'estimated': psi_est_test[0],
             })
             if data.psi_test is not None:
@@ -210,24 +243,28 @@ def main(args=None):
         print('Unable to plot variable importance')
 
 
+    def f_sampler_mean(f_sampler):
+    	# returns callable that applies inverse link
+    	return lambda x: inverse_link[args.family](f_sampler(x))
+
 
     # slices of prior predicive
     try:
         if hasattr(m, 'sample_f_prior'):
-            fig, ax = util.plot_slices(m.sample_f_prior, data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=data.f, figsize=(4*args.dim_in,4))
+            fig, ax = util.plot_slices(m.sample_f_prior, data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=data.f, figsize=(4*dim_in,4))
             fig.savefig(os.path.join(args.dir_out,'slices_prior.png'))
             plt.close('all')
     except:
         print('Unable to plot prior predictive')
 
     # slices of posterior predicive
-    try:
-        if hasattr(m, 'sample_f_post'):
-            fig, ax = util.plot_slices(m.sample_f_post, data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=data.f, figsize=(4*args.dim_in,4))
-            fig.savefig(os.path.join(args.dir_out,'slices_post.png'))
-            plt.close('all')
-    except:
-        print('Unable to plot posterior predictive')
+    #try:
+    if hasattr(m, 'sample_f_post'):
+        fig, ax = util.plot_slices(f_sampler_mean(m.sample_f_post), data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=f_sampler_mean(data.f), figsize=(4*dim_in,4))
+        fig.savefig(os.path.join(args.dir_out,'slices_post.png'))
+        plt.close('all')
+    #except:
+        #print('Unable to plot posterior predictive')
 
 
     # plot lengthscale and variance over optimization if available
@@ -236,9 +273,13 @@ def main(args=None):
         if n_hyper > 0:
             fig, ax = plt.subplots(1, n_hyper, figsize=(12,3))
             for i, (key, val) in enumerate(hyperparam_hist.items()):
-                ax[i].plot(val, label=key)
-                ax[i].set_xlabel('epoch')
-                ax[i].legend()
+                try:
+                    a = ax[i]
+                except:
+                    a = ax
+                a.plot(val, label=key)
+                a.set_xlabel('epoch')
+                a.legend()
             fig.savefig(os.path.join(args.dir_out,'hyperparameter_opt.png'))
             
     # RMSE
@@ -253,12 +294,24 @@ def main(args=None):
             y_hat_test[ii,:] = m.sample_f_post(data.x_test).reshape(1,-1)
 
         # posterior predictive mean
-        y_hat = np.mean(y_hat, 0).reshape(-1,1)
-        y_hat_test = np.mean(y_hat_test, 0).reshape(-1,1)
+        y_hat_mean = np.mean(y_hat, 0).reshape(-1,1)
+        y_hat_mean_test = np.mean(y_hat_test, 0).reshape(-1,1)
+
+        # posterior predictive std
+        y_hat_std = np.std(y_hat, 0).reshape(-1,1)
+        y_hat_std_test = np.std(y_hat_test, 0).reshape(-1,1)
 
         # risk 
-        res['rmse'] = np.sqrt(np.mean((data.y_train - y_hat)**2))
-        res['rmse_test'] = np.sqrt(np.mean((data.y_test - y_hat_test)**2))
+        res['rmse'] = np.sqrt(np.mean((data.y_train - y_hat_mean)**2))
+        res['rmse_test'] = np.sqrt(np.mean((data.y_test - y_hat_mean_test)**2))
+
+        res['post_pred_mean_test'] = y_hat_mean_test
+        res['post_pred_std_test'] = y_hat_std_test
+
+        # test log likelihood
+        res['test_ll'] = util.test_log_likelihood_indep(y_hat_mean_test, y_hat_std_test, data.y_test)
+
+
     except:
         print('Unable to compute risk')
 
