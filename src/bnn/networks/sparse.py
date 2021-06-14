@@ -849,7 +849,7 @@ class RffGradPenHyper_v3(object):
     - L2 penalty only
     - closed-form solution
     - hyperparameters: lengthscale, prior_w2_sig2 (amplitude variance), and scale_global (regularization strength)
-    - all hyperparameters can be input-specific 
+    - lengthscale and scale_global hyperparameters can be input-specific 
 
     Inputs:
     -   dim_in: dimension of inputs (int)
