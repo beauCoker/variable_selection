@@ -151,9 +151,12 @@ def plot_slice(f_sampler, x, y, quantile=.5, dim=0, n_samp=500, f_true=None, ax=
     x_plot_all[:, dim] = x_plot
 
     # sample from model
-    f_samp_plot = np.zeros((n_samp, x_plot.shape[0]))
-    for i in range(n_samp):
-        f_samp_plot[i,:] = f_sampler(x_plot_all).reshape(-1)
+    try:
+        f_samp_plot[i,:] = f_sampler(x_plot_all, n_samp) # (n_samp, N)
+    except:
+        f_samp_plot = np.zeros((n_samp, x_plot.shape[0]))
+        for i in range(n_samp):
+            f_samp_plot[i,:] = f_sampler(x_plot_all).reshape(-1)
 
     # plot
     ax.scatter(x[:,dim], y) # training data

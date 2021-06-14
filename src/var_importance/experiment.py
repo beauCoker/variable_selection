@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 
 # local imports
 import util as util
@@ -40,7 +41,7 @@ def get_parser():
     # general inference arguments
     parser.add_argument('--n_burnin_hmc', type=int, default=5e3)
     parser.add_argument('--n_sample_hmc', type=int, default=10e3)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--family', type=str, default='gaussian')
@@ -66,11 +67,17 @@ def get_parser():
     parser.add_argument('--infer_hyper', action='store_true')
     parser.add_argument('--optimize_hyper', action='store_true')
 
+    parser.add_argument('--opt_lengthscale', type=str, default='NO', help='set to "SINGLE", "ALL", or "NO"')
+    parser.add_argument('--opt_scale_global', type=str, default='NO', help='set to "SINGLE", "ALL", or "NO"')
+    parser.add_argument('--opt_prior_w2_sig2', action='store_true')
+
     # GP options
     parser.add_argument('--opt_likelihood_variance', action='store_true')
     parser.add_argument('--opt_kernel_hyperparam', action='store_true')
     parser.add_argument('--kernel_lengthscale', type=float, default=1.0)
     parser.add_argument('--kernel_variance', type=float, default=1.0)
+
+    parser.add_argument('--n_inducing', type=int, default=10)
 
     return parser
 
@@ -130,6 +137,10 @@ def main(args=None):
         res['kernel_variance'] = m.model.kern.variance.item()
         print(m.model) 
 
+    if args.model=='SGP':
+        m = models.SGPVarImportance(data.x_train, data.y_train, args.sig2, lengthscale=args.kernel_lengthscale, variance=args.kernel_variance, n_inducing=args.n_inducing, family=args.family)
+        hyperparam_hist = m.train(args.epochs, learning_rate=args.lr, minibatch_size = args.batch_size, opt_inducing=True)
+
     elif args.model=='BAYESLINEARLASSO':
         m = models.BayesLinearLassoVarImportance(data.x_train, data.y_train, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=[args.scale_global]*dim_in)          
         samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc)
@@ -158,9 +169,6 @@ def main(args=None):
             w2_map = None
             ##
 
-            res['opt_lengthscale'] = m.model.lengthscale
-            res['opt_prior_w2_sig2'] = m.model.prior_w2_sig2
-
             # plot map estimate
             if w2_map is not None:
                 f_map = lambda x: m.model.forward(w2=w2_map, x=x).numpy()
@@ -171,6 +179,36 @@ def main(args=None):
 
         #samples, accept = m.train(num_results = args.n_sample_hmc, num_burnin_steps = args.n_burnin_hmc, infer_lengthscale=args.infer_hyper, infer_prior_w2_sig2=False, w2_init=w2_map) # OPTIONS HARDCODED
         m.fit(num_results = args.n_sample_hmc) # closed form
+
+    elif args.model=='RFFGRADPENHYPER_v3':
+
+        # set lengthscale args
+        if args.opt_lengthscale=='SINGLE':
+            opt_lengthscale = True
+            lengthscale = args.lengthscale
+        elif args.opt_lengthscale=='ALL':
+            opt_lengthscale = True
+            lengthscale = [args.lengthscale]*dim_in
+        elif args.opt_lengthscale=='NO':
+            opt_lengthscale = False
+            lengthscale = args.lengthscale
+
+        # set scale_global args
+        if args.opt_scale_global=='SINGLE':
+            opt_scale_global = True
+            scale_global = args.scale_global
+        elif args.opt_scale_global=='ALL':
+            opt_scale_global = True
+            scale_global = [args.scale_global]*dim_in
+        elif args.opt_scale_global=='NO':
+            opt_scale_global = False
+            scale_global = args.scale_global
+
+        m = models.RffGradPenVarImportanceHyper_v3(data.x_train, data.y_train, n_rff, prior_w2_sig2=args.prior_w2_sig2, noise_sig2=args.sig2, scale_global=scale_global, lengthscale=lengthscale, penalty_type=args.penalty_type, family=args.family)
+        
+        if any([opt_lengthscale, args.opt_prior_w2_sig2, opt_scale_global]):
+            hyperparam_hist = m.train(n_epochs=args.epochs, learning_rate=args.lr, batch_size=args.batch_size, opt_lengthscale=opt_lengthscale, opt_prior_w2_sig2=args.opt_prior_w2_sig2, opt_scale_global=opt_scale_global)        
+        m.fit() 
 
     elif args.model=='RFF':
         m = models.RffVarImportance(Z)
@@ -206,9 +244,22 @@ def main(args=None):
             psi_est_test = m.estimate_psi(data.x_test)
             res['psi_mean_test'] = psi_est_test[0]
             res['psi_var_test'] = psi_est_test[1]
+
     except:
         print('Unable to compute variable importance')
 
+    
+    # variable selection
+    try:
+        if hasattr(data, 'nonzero'):
+            if data.nonzero is not None:
+                psi_prob = psi_est_train[0] / np.sum(psi_est_train[0])
+                res['auc'] = roc_auc_score(data.nonzero.astype(int).reshape(-1), psi_prob.reshape(-1))
+        
+        if hasattr(data, 'psi_train'):
+            res['psi_log_lik'] = util.test_log_likelihood_indep(mean=psi_est_train[0], std=np.sqrt(psi_est_train[1]), test_y=data.psi_train)
+    except:
+        print('Unable to compute variable selection')
 
     # barplot of variable importance
     try:
@@ -258,29 +309,40 @@ def main(args=None):
         print('Unable to plot prior predictive')
 
     # slices of posterior predicive
-    #try:
-    if hasattr(m, 'sample_f_post'):
-        fig, ax = util.plot_slices(f_sampler_mean(m.sample_f_post), data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=f_sampler_mean(data.f), figsize=(4*dim_in,4))
-        fig.savefig(os.path.join(args.dir_out,'slices_post.png'))
-        plt.close('all')
-    #except:
-        #print('Unable to plot posterior predictive')
+    try:
+        if hasattr(m, 'sample_f_post'):
+            fig, ax = util.plot_slices(f_sampler_mean(m.sample_f_post), data.x_train, data.y_train, quantile=.5, n_samp=100, f_true=f_sampler_mean(data.f), figsize=(4*dim_in,4))
+            fig.savefig(os.path.join(args.dir_out,'slices_post.png'))
+            plt.close('all')
+    except:
+        print('Unable to plot posterior predictive')
 
 
     # plot lengthscale and variance over optimization if available
     if 'hyperparam_hist' in locals():
         n_hyper = len(hyperparam_hist.keys())
         if n_hyper > 0:
-            fig, ax = plt.subplots(1, n_hyper, figsize=(12,3))
+            fig, ax = plt.subplots(1, n_hyper, figsize=(12,3), tight_layout=True)
             for i, (key, val) in enumerate(hyperparam_hist.items()):
+                # save final value
+                res['opt_%s' % key] = val[-1]
+
+                # plot
                 try:
                     a = ax[i]
                 except:
                     a = ax
-                a.plot(val, label=key)
+                val = np.vstack(val)
+                if val.shape[-1] == dim_in and hasattr(data, 'nonzero'):
+                    # assume one parameter for each input dimension
+                    a.plot(val[:, data.nonzero.astype(bool)], linestyle='-')
+                    a.plot(val[:, np.logical_not(data.nonzero.astype(bool))], linestyle='--')
+                else:
+                    a.plot(val, label=key)
+
                 a.set_xlabel('epoch')
-                a.legend()
-            fig.savefig(os.path.join(args.dir_out,'hyperparameter_opt.png'))
+                a.set_title(key)
+            fig.savefig(os.path.join(args.dir_out,'hyperparameter_opt.png'), bbox_inches='tight')
             
     # RMSE
     try:
@@ -289,9 +351,13 @@ def main(args=None):
         y_hat = np.zeros((n_samp_risk, data.x_train.shape[0]))
         y_hat_test = np.zeros((n_samp_risk, data.x_test.shape[0]))
 
-        for ii in range(n_samp_risk):
-            y_hat[ii,:] = m.sample_f_post(data.x_train).reshape(1,-1)
-            y_hat_test[ii,:] = m.sample_f_post(data.x_test).reshape(1,-1)
+        try:
+            y_hat = m.sample_f_post(data.x_train, n_samp=n_samp_risk)
+            y_hat_test = m.sample_f_post(data.x_test, n_samp=n_samp_risk)
+        except:
+            for ii in range(n_samp_risk):
+                y_hat[ii,:] = m.sample_f_post(data.x_train).reshape(1,-1)
+                y_hat_test[ii,:] = m.sample_f_post(data.x_test).reshape(1,-1)
 
         # posterior predictive mean
         y_hat_mean = np.mean(y_hat, 0).reshape(-1,1)

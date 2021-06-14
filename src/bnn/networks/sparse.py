@@ -514,7 +514,6 @@ class RffGradPenHyper_v2(object):
             return log_prob
 
         return unnormalized_log_prob
-        
 
 
 
@@ -843,7 +842,239 @@ class RffGradPenHyper_v2(object):
 
         return mu, sig2
 
+    
+
+class RffGradPenHyper_v3(object):
+    """
+    - L2 penalty only
+    - closed-form solution
+    - hyperparameters: lengthscale, prior_w2_sig2 (amplitude variance), and scale_global (regularization strength)
+    - all hyperparameters can be input-specific 
+
+    Inputs:
+    -   dim_in: dimension of inputs (int)
+    -   dim_hidden: number of hidden units (int)
+    -   dim_out: output dimension (int)
+    -   prior_w2_sig2: prior variance of output weights. Corresponds to amplitude variance of RBF kernel. (scalar)
+    -   noise_sig2: observational noise (scalar)
+    -   scale_global: NOT IMPLEMENTED
+    -   groups: NOT IMPLEMENTED
+    -   scale_groups: NOT IMPLEMENTED
+    -   lengthscale: Corresponds to lengthscale of RBF kernel. (scalar)
+    -   penalty_type: select 'l1' for lasso penalty, 'l2' for ridge penalty (str)
+    """
+    def __init__(self, dim_in, dim_hidden, dim_out, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l2', family='gaussian', dtype=tf.float32):
+        super(RffGradPenHyper_v3, self).__init__()
+
+        assert scale_groups is None
+        assert penalty_type=='l2'
+        assert family=='gaussian'
+
+        self.dtype = dtype
+
+        ### architecture
+        self.dim_in = dim_in
+        self.dim_hidden = dim_hidden
+        self.dim_out = dim_out
+        self.noise_sig2 = noise_sig2
+        self.groups = groups # list of lists with grouping (e.g. [[1,2,3], [4,5]])
+        self.scale_groups = scale_groups
+        self.penalty_type = penalty_type
+        self.family = family
+
+        # hyperparameters
+        self.lengthscale = tf.reshape(tf.cast(tf.convert_to_tensor(lengthscale), self.dtype), -1)
+        self.prior_w2_sig2 = tf.reshape(tf.cast(tf.convert_to_tensor(prior_w2_sig2), self.dtype), -1)
+        self.scale_global = tf.reshape(tf.cast(tf.convert_to_tensor(scale_global), self.dtype), -1)
+
+        self.sample_features()
+        self.act = lambda z: sqrt(2/self.dim_hidden)*tf.math.cos(z)
+
+    def sample_features(self):
+        # sample random weights for RFF features
+        self.w1 = tf.cast(tf.convert_to_tensor(np.random.normal(0,1,(self.dim_hidden, self.dim_in))), dtype=tf.float32)
+        self.b1 = tf.cast(tf.convert_to_tensor(np.random.uniform(0,2*pi,(self.dim_hidden,))), dtype=tf.float32)
+
+    def compute_xw1(self, x, lengthscale=None):
+        if not tf.is_tensor(x):
+            x = tf.convert_to_tensor(x, dtype=tf.float32) # (n, dim_in)
+        if lengthscale is None:
+            lengthscale = self.lengthscale # (dim_in, )
+        return (x / tf.expand_dims(lengthscale, 0)) @ tf.transpose(self.w1) # (n, dim_hidden)
+
+    def hidden_features(self, x=None, xw1=None, lengthscale=None):
+        if xw1 is None:
+            xw1 = self.compute_xw1(x, lengthscale=lengthscale)
+        if lengthscale is None:
+            lengthscale = self.lengthscale
+
+        return self.act(xw1 + tf.reshape(self.b1, (1,-1))) # (n, dim_hidden)
+
+    def forward(self, w2, x=None, xw1=None, lengthscale=None, h=None):
+        if h is None:
+            if xw1 is None:
+                xw1 = self.compute_xw1(x, lengthscale=lengthscale)
+            if lengthscale is None:
+                lengthscale = self.lengthscale
+            h = self.hidden_features(x, xw1, lengthscale)
         
+        return h@tf.reshape(w2,(-1,1))
+
+    def jacobian_hidden_features(self, x=None, xw1=None, lengthscale=None):
+        if xw1 is None:
+            xw1 = self.compute_xw1(x, lengthscale=None)
+        if lengthscale is None:
+            lengthscale = self.lengthscale
+        return -sqrt(2/self.dim_hidden) * tf.expand_dims(self.w1 / tf.expand_dims(lengthscale, 0), 0) * tf.expand_dims(tf.math.sin(xw1 + tf.reshape(self.b1, (1,-1))), -1) # analytical jacobian
+
+    def grad_norm(self, x=None, xw1=None, lengthscale=None):
+        J = self.jacobian_hidden_features(x=x, xw1=xw1, lengthscale=lengthscale)
+        Ax_d = [1/J.shape[0]*tf.transpose(J[:,:,d])@J[:,:,d] for d in range(self.dim_in)]
+        return Ax_d # list of length D, each element is K x K
+
+    def make_log_marginal_likelihood(self):
+
+        @tf.function
+        def log_marginal_likelihood(x, y, lengthscale, prior_w2_sig2, scale_global):
+
+            # precompute
+            N = x.shape[0]
+            K = self.dim_hidden
+            yy = tf.transpose(y) @ y
+            h = self.hidden_features(x=x, xw1=None, lengthscale=lengthscale)
+
+            # gradients
+            Ax_d = self.grad_norm(x, lengthscale=lengthscale) # list of length D, each element is K x K
+            Ax_d = tf.stack(Ax_d) * tf.reshape(scale_global,(-1,1,1)) # (D, K, K)
+            Ax = tf.reduce_sum(tf.stack(Ax_d),0) # sum over input dimension
+
+            # inverse of prior covariance of w2
+            if self.prior_w2_sig2.shape[0]==1:
+                prior_cov_inv = tf.eye(self.dim_hidden)/prior_w2_sig2
+            else:
+                prior_cov_inv = tf.linalg.diag(1/prior_w2_sig2)
+            prior_cov_inv += Ax
+            #prior_cov = tf.linalg.inv(prior_cov_inv) # not sure if there's a way around this...
+
+            # cholesky stuff
+            A = prior_cov_inv + tf.transpose(h)@h/self.noise_sig2
+            L = tf.linalg.cholesky(A)
+            alpha = tf.linalg.solve(L, tf.transpose(h)@y)
+            R = tf.linalg.cholesky(prior_cov_inv)
+
+            # log marginal likelihood
+            log_prob = \
+                -N/2*tf.math.log(2*np.pi*self.noise_sig2) \
+                -1/(2*self.noise_sig2)*yy \
+                +tf.reduce_sum(tf.math.log(tf.linalg.diag_part(R))) \
+                -tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L))) \
+                +1/(2*self.noise_sig2**2) * tf.transpose(alpha)@alpha
+            return log_prob
+
+        return log_marginal_likelihood
+
+    def train_log_marginal_likelihood(self, x, y, n_epochs, learning_rate=0.001, clipvalue=100, batch_size=None, opt_lengthscale=True, opt_prior_w2_sig2=True, opt_scale_global=True):
+        
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+        
+        # initialize
+        lengthscale_raw = tf.Variable(tfp.math.softplus_inverse(tf.cast(tf.convert_to_tensor(self.lengthscale), tf.float32)), name='lengthscale') # note: _raw is untransformed by softplus
+        prior_w2_sig2_raw = tf.Variable(tfp.math.softplus_inverse(tf.cast(tf.convert_to_tensor(self.prior_w2_sig2), tf.float32)), name='prior_w2_sig2')
+        scale_global_raw = tf.Variable(tfp.math.softplus_inverse(tf.cast(tf.convert_to_tensor(self.scale_global), tf.float32)), name='scale_global')
+        
+        # initialize 
+        hyperparam_hist = {}
+        hyperparam_hist['lengthscale'] = [tf.math.softplus(lengthscale_raw).numpy()]
+        hyperparam_hist['prior_w2_sig2'] = [tf.math.softplus(prior_w2_sig2_raw).numpy()]
+        hyperparam_hist['scale_global'] = [tf.math.softplus(scale_global_raw).numpy()]
+        hyperparam_hist['loss'] = [None]
+
+        # batch dataset
+        train_dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        if batch_size is None:
+            batch_size = x.shape[0]# full batch
+        train_dataset = train_dataset.batch(batch_size)
+
+        # set up optimization
+        opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        log_marginal_likelihood = self.make_log_marginal_likelihood()
+        log_marginal_likelihood_raw = lambda x, y, lengthscale_raw, prior_w2_sig2_raw, scale_global_raw: log_marginal_likelihood(x, y, tf.math.softplus(lengthscale_raw), tf.math.softplus(prior_w2_sig2_raw), tf.math.softplus(scale_global_raw)) # takes raw values
+
+        # decide which hyperparameters to optimize
+        var_list = []
+        lr_mult = []
+        if opt_lengthscale:
+            var_list += [lengthscale_raw]
+            lr_mult += [1.0]
+        if opt_prior_w2_sig2:
+            var_list += [prior_w2_sig2_raw]
+            lr_mult += [1.0]
+        if opt_scale_global:
+            var_list += [scale_global_raw]
+            lr_mult += [100.0]
+
+        @tf.function
+        def train_step(x, y):
+            with tf.GradientTape() as tape:
+                loss = -log_marginal_likelihood_raw(x, y, lengthscale_raw, prior_w2_sig2_raw, scale_global_raw)
+            grads = tape.gradient(loss, var_list)
+            grads = [g*m for g, m in zip(grads,lr_mult)]
+            #grads = [tf.clip_by_norm(g, clipvalue) for g in grads] # gradient clipping
+            opt.apply_gradients(zip(grads, var_list))
+            return loss
+
+        # optimize
+        for epoch in range(n_epochs):
+            for xbatch, ybatch in train_dataset:
+                loss = train_step(xbatch, ybatch)
+  
+            hyperparam_hist['lengthscale'].append(tf.math.softplus(lengthscale_raw).numpy())
+            hyperparam_hist['prior_w2_sig2'].append(tf.math.softplus(prior_w2_sig2_raw).numpy())
+            hyperparam_hist['scale_global'].append(tf.math.softplus(scale_global_raw).numpy())
+            hyperparam_hist['loss'].append(loss.numpy().item())
+            
+        # unpack
+        self.lengthscale = tf.math.softplus(lengthscale_raw)
+        self.prior_w2_sig2 = tf.math.softplus(prior_w2_sig2_raw)
+        self.scale_global = tf.math.softplus(scale_global_raw)
+        
+        return hyperparam_hist
+
+
+    def fit(self, x, y):
+        '''
+        Computes conjugate posterior
+        '''
+        
+        x = tf.cast(tf.convert_to_tensor(x), tf.float32)
+        y = tf.cast(tf.convert_to_tensor(y), tf.float32)
+
+        h = self.hidden_features(x, lengthscale=self.lengthscale)
+        Ax_d = self.grad_norm(x, lengthscale=self.lengthscale) # (N, K, D)
+        #Ax_d = Ax_d * tf.expand_dims(self.scale_global,(0,1)) # multiply by scale (N, K, D)
+        Ax_d = [s*A for s,A in zip(self.scale_global, Ax_d)] # multiply by scale (N, K, D)
+        Ax = tf.reduce_sum(tf.stack(Ax_d),0) # sum over input dimension
+
+        if self.prior_w2_sig2.shape[0]==1:
+            prior_sig2inv_mat = tf.eye(self.dim_hidden)/self.prior_w2_sig2
+        else:
+            prior_sig2inv_mat = tf.linalg.diag(self.prior_w2_sig2)
+        prior_sig2inv_mat += Ax # prior includes gradient penalty
+
+
+        sig2 = tf.linalg.inv(prior_sig2inv_mat + tf.transpose(h)@(h)/self.noise_sig2) # Should replace with cholesky
+        mu = sig2 @ tf.transpose(h)@y/self.noise_sig2
+
+        return mu, sig2
+
+        
+
+
+
+
+
+
 class RffHs(nn.Module):
     """
     RFF model with horseshoe

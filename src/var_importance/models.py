@@ -9,7 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-#import tensorflow as tf
+import tensorflow as tf
+import gpflow
 #from tensorflow import keras
 #import rpy2.robjects as robjects
 #from rpy2.robjects.packages import importr
@@ -106,6 +107,89 @@ class GPyVarImportance(object):
         mu = np.zeros(x.shape[0])
         C = self.kernel.K(x,x)
         return np.random.multivariate_normal(mu,C,1)
+
+
+class SGPVarImportance(object):
+    def __init__(self, X, Y, noise_sig2, lengthscale=1.0, variance=1.0, n_inducing=10, family='gaussian'):
+        super().__init__()
+
+        N = X.shape[0]
+
+        # likelihood
+        if family=='gaussian':
+            likelihood = gpflow.likelihoods.Gaussian(variance=noise_sig2)
+        elif family=='binomial':
+            likelihood = gpflow.likelihoods.Bernoulli()
+
+        # data
+        self.train_dataset = tf.data.Dataset.from_tensor_slices((X, Y)).repeat().shuffle(N)
+
+        # inducing points
+        Z = X[np.random.choice(N, size=n_inducing, replace=False), :] # randomly sample training observations as initial test points
+
+        # kernel
+        kernel = gpflow.kernels.SquaredExponential(lengthscales=[lengthscale]*X.shape[1], variance=variance) # does ARD
+
+        # model
+        self.model = gpflow.models.SVGP(kernel, likelihood, Z, num_data=N)
+
+        if family=='gaussian':
+            gpflow.set_trainable(self.model.likelihood.variance, False) # fix noise
+
+    def train(self, epochs, learning_rate=0.001, minibatch_size = 100, opt_inducing=True):
+        
+        if not opt_inducing:
+            gpflow.set_trainable(m.inducing_variable, False)
+
+        # recrod hyperparameters during optimization
+        hyperparam_hist = {
+        'lengthscales': [self.model.kernel.lengthscales.numpy()],
+        'variance': [self.model.kernel.variance.numpy()],
+        'elbo': [None]
+        }
+
+        # Create an Adam Optimizer action
+        logf = []
+        train_iter = iter(self.train_dataset.batch(minibatch_size))
+        training_loss = self.model.training_loss_closure(train_iter, compile=True)
+        optimizer = tf.optimizers.Adam(learning_rate=learning_rate)
+
+        @tf.function
+        def optimization_step():
+            optimizer.minimize(training_loss, self.model.trainable_variables)
+
+        for epoch in range(epochs):
+            optimization_step()
+            if epoch % 10 == 0:
+                hyperparam_hist['lengthscales'].append(self.model.kernel.lengthscales.numpy())
+                hyperparam_hist['variance'].append(self.model.kernel.variance.numpy())
+                hyperparam_hist['elbo'].append(-training_loss().numpy())
+        return hyperparam_hist
+
+        
+    
+    def estimate_psi(self, X, n_samp=1000):
+        '''
+        estimates mean and variance of variable importance psi
+        X:  inputs to evaluate gradient
+        n_samp:  number of MC samples
+        '''
+        return None
+
+    def sample_f_post(self, x, n_samp=1):
+        # inputs and outputs are numpy arrays
+        f = self.model.predict_f_samples(x, n_samp).numpy() # (n_samp, N)
+        if n_samp==1:
+            return f.reshape(-1,1) # (N, 1)
+        else:
+            return np.squeeze(f) # (n_samp, N)
+
+    #def sample_f_prior(self, x):
+    #    mu = np.zeros(x.shape[0])
+    #    C = self.kernel.K(x,x)
+    #    return np.random.multivariate_normal(mu,C,1)
+
+
 
 class RffVarImportance(object):
     def __init__(self, X):
@@ -718,6 +802,50 @@ class RffGradPenVarImportanceHyper_v2(object):
 
 
 
+class RffGradPenVarImportanceHyper_v3(object):
+    def __init__(self, X, Y, dim_hidden=50, prior_w2_sig2=1.0, noise_sig2=1.0, scale_global=1.0, groups=None, scale_groups=None, lengthscale=1.0, penalty_type='l1', family='gaussian'):
+        super().__init__()
+        self.X = X
+        self.Y = Y
+        self.model = networks.sparse.RffGradPenHyper_v3(dim_in=X.shape[1], dim_hidden=dim_hidden, dim_out=Y.shape[1], prior_w2_sig2=prior_w2_sig2, noise_sig2=noise_sig2, scale_global=scale_global, groups=groups, scale_groups=scale_groups, lengthscale=lengthscale, penalty_type=penalty_type, family=family)
 
+    def train(self, n_epochs=100, learning_rate=0.001, batch_size=None, opt_lengthscale=True, opt_prior_w2_sig2=True, opt_scale_global=True):
+        return self.model.train_log_marginal_likelihood(self.X, self.Y, n_epochs=n_epochs, learning_rate=learning_rate, clipvalue=100, batch_size=batch_size, opt_lengthscale=opt_lengthscale, opt_prior_w2_sig2=opt_prior_w2_sig2, opt_scale_global=opt_scale_global)
+
+    def fit(self):
+        mu, sig2 = self.model.fit(self.X, self.Y)
+
+        # hacks for now
+        self.mu = mu.numpy()
+        self.sig2 = sig2.numpy()
+        
+    def estimate_psi(self, X=None, n_samp=1000):
+        '''
+        Uses closed form
+
+        estimates mean and variance of variable importance psi
+        X:  inputs to evaluate gradient
+        n_samp:  number of MC samples
+        '''
+
+        # allocate space
+        psi = np.zeros((n_samp, X.shape[1]))
+        Ax_d = self.model.grad_norm(x=X) 
+
+        w2 = np.random.multivariate_normal(self.mu.reshape(-1), self.sig2, n_samp).astype(np.float32)
+        
+        for i in range(n_samp):            
+            for d in range(X.shape[1]):
+                psi[i,d] = w2[i,:].reshape(1,-1)@Ax_d[d]@w2[i,:].reshape(-1,1) 
+
+        return np.mean(psi,0), np.var(psi,0)
+
+    def sample_f_post(self, x, n_samp=1):
+        w2 = np.random.multivariate_normal(self.mu.reshape(-1), self.sig2, n_samp).astype(np.float32)
+        if n_samp==1:
+            return self.model.forward(w2, x=x).numpy() # (N, 1)
+        else:
+            h = self.model.hidden_features(x).numpy() # (N, K)
+            return w2 @ h.T # (n_samp, N)
 
 

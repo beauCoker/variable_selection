@@ -41,12 +41,14 @@ class Toy(Dataset):
                  noise_sig2=1.0,
                  seed=0,
                  standardize=True,
-                 family = 'gaussian'):
+                 family = 'gaussian',
+                 nonzero = None):
 
         self.f = lambda x: f(x).reshape(-1,1) # makes sure output is (n,1)
         self.noise_sig2 = noise_sig2
         self.dim_in = x_train.shape[1]
         self.family = family
+        self.nonzero = nonzero # index of varibles related to response. not used for anything, optional. 
 
         # train
         self.x_train = x_train
@@ -211,7 +213,9 @@ def sin_toy(dim_in, noise_sig2, n_train, n_test=100, seed_x=0, seed_noise=0, n_n
     # ground truth function
     f = lambda x: np.sum(np.sin(x[:,:n_nonzero]),-1).reshape(-1,1)
 
-    return Toy(f, x_train, x_test, noise_sig2, seed_noise)
+    nonzero = np.concatenate([np.ones(n_nonzero), np.zeros(dim_in-n_nonzero)])
+
+    return Toy(f, x_train, x_test, noise_sig2, seed_noise, nonzero=nonzero)
 
 def rff_toy(dim_in, noise_sig2, n_train, n_test=100, dim_hidden=50, seed_x=0, seed_w=0, seed_noise=0, n_nonzero=1):
 
@@ -230,7 +234,9 @@ def rff_toy(dim_in, noise_sig2, n_train, n_test=100, dim_hidden=50, seed_x=0, se
     act = lambda z: np.sqrt(2/dim_hidden)*np.cos(z)
     f = lambda z: act(z[:, :n_nonzero]@w1.T + b1.T) @ w2.T
 
-    return Toy(f, x_train, x_test, noise_sig2, seed_noise)
+    nonzero = np.concatenate([np.ones(n_nonzero), np.zeros(dim_in-n_nonzero)])
+
+    return Toy(f, x_train, x_test, noise_sig2, seed_noise, nonzero=nonzero)
 
 
 def mixselect_toy(dim_in, noise_sig2, n_train, n_test=100, seed_x=0, seed_noise=0, version=1):
